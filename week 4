@@ -1,0 +1,476 @@
+/**
+ * ============================================================
+ *  Real-Time Multi-Sensor Data Acquisition System
+ *  Week 4 — Algorithm Design & Initial Implementation
+ *  Course : Analysis and Design of Algorithms (CPE2206)
+ *  Target : ESP32 (simulation fallback for desktop / POSIX)
+ *  Author : Group 1, Soroti University
+ *  Date   : April 10, 2026
+ * ============================================================
+ *
+ * Compile (desktop simulation):
+ *   gcc -Wall -Wextra -o multisensor multisensor_week4.c -lm
+ *   ./multisensor
+ *
+ * For ESP32 (Arduino IDE / PlatformIO):
+ *   - Place this file in your src/ folder.
+ *   - Set #define SIMULATION 1 to 0 and wire up real sensors.
+ * ============================================================
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+
+/* ── Build switch ─────────────────────────────────────────── */
+#define SIMULATION 1   /* 1 = desktop sim, 0 = real ESP32 HW  */
+
+/* ── Sensor channel indices ───────────────────────────────── */
+#define SENSOR_TEMP   0
+#define SENSOR_HUM    1
+#define SENSOR_SOIL   2
+#define NUM_SENSORS   3
+
+/* ── Circular buffer sizes (from Week 2 memory analysis) ──── */
+#define TEMP_BUF_SIZE   60   /* 60 s of history @ 1 Hz          */
+#define HUM_BUF_SIZE    60
+#define SOIL_BUF_SIZE   60
+
+/* ── Moving-average window sizes ─────────────────────────── */
+#define TEMP_WIN   5
+#define HUM_WIN    5
+#define SOIL_WIN   10
+
+/* ── Anomaly thresholds ───────────────────────────────────── */
+#define TEMP_LOW    10.0f    /* °C  */
+#define TEMP_HIGH   40.0f
+#define HUM_LOW     20.0f    /* %RH */
+#define HUM_HIGH    90.0f
+#define SOIL_LOW   500.0f    /* ADC */
+#define SOIL_HIGH 3500.0f
+
+/* ── Priority queue capacity ─────────────────────────────── */
+#define PQ_CAPACITY 16
+
+/* ── Sentinel for invalid readings ──────────────────────── */
+#define INVALID_VAL (-9999.0f)
+
+/* ============================================================
+ *  1. CIRCULAR BUFFER
+ * ============================================================ */
+typedef struct {
+    float  *data;       /* heap-allocated array                 */
+    int     size;       /* allocated capacity                   */
+    int     head;       /* next write position                  */
+    int     tail;       /* oldest element position              */
+    int     count;      /* number of valid elements             */
+    double  running_sum;/* kept for O(1) moving-average update  */
+} CircularBuffer;
+
+/**
+ * cb_init — allocate and initialise a circular buffer.
+ * O(size) to zero the array; O(1) thereafter per operation.
+ */
+void cb_init(CircularBuffer *cb, int size) {
+    cb->data        = (float *)calloc(size, sizeof(float));
+    cb->size        = size;
+    cb->head        = 0;
+    cb->tail        = 0;
+    cb->count       = 0;
+    cb->running_sum = 0.0;
+}
+
+/**
+ * cb_write — write one value; overwrite oldest on overflow.
+ * Time: O(1)   Space: O(1) additional
+ */
+void cb_write(CircularBuffer *cb, float value) {
+    if (cb->count == cb->size) {
+        /* Buffer full: evict the oldest element first */
+        cb->running_sum -= cb->data[cb->tail];
+        cb->tail = (cb->tail + 1) % cb->size;
+        cb->count--;
+    }
+    cb->running_sum    += value;
+    cb->data[cb->head]  = value;
+    cb->head            = (cb->head + 1) % cb->size;
+    cb->count++;
+}
+
+/**
+ * cb_read_latest — return the most recent value without removing it.
+ * Time: O(1)
+ */
+float cb_read_latest(const CircularBuffer *cb) {
+    if (cb->count == 0) return INVALID_VAL;
+    int idx = (cb->head - 1 + cb->size) % cb->size;
+    return cb->data[idx];
+}
+
+/**
+ * cb_read_at_offset — return element 'offset' positions before head.
+ * Offset 0 = newest, offset (count-1) = oldest.
+ * Time: O(1)
+ */
+float cb_read_at_offset(const CircularBuffer *cb, int offset) {
+    if (offset < 0 || offset >= cb->count) return INVALID_VAL;
+    int idx = (cb->head - 1 - offset + cb->size * 2) % cb->size;
+    return cb->data[idx];
+}
+
+void cb_free(CircularBuffer *cb) {
+    free(cb->data);
+    cb->data = NULL;
+}
+
+/* ============================================================
+ *  2. MOVING AVERAGE  (Sliding-Window / Divide-and-Conquer)
+ * ============================================================ */
+typedef struct {
+    double  sum;         /* running window sum                  */
+    int     window;      /* window width W                      */
+    int     filled;      /* 1 once W samples have been seen     */
+} MovingAvg;
+
+void ma_init(MovingAvg *ma, int window) {
+    ma->sum    = 0.0;
+    ma->window = window;
+    ma->filled = 0;
+}
+
+/**
+ * ma_update — compute the new moving average given the circular buffer.
+ *
+ * Recurrence (divide-and-conquer):
+ *   avg[n] = avg[n-1] + (x[n] - x[n-W]) / W
+ *
+ * This reuses the previously solved sub-problem (avg[n-1]) and
+ * adds only the marginal delta, giving O(1) per update.
+ *
+ * Time: O(1)   Space: O(1)
+ */
+float ma_update(MovingAvg *ma, const CircularBuffer *cb) {
+    int W = ma->window;
+    if (cb->count < W) {
+        /* Not enough history: simple mean of what we have       */
+        if (cb->count == 0) return INVALID_VAL;
+        return (float)(cb->running_sum / cb->count);
+    }
+
+    /* Sliding-window recurrence */
+    float x_new = cb_read_at_offset(cb, 0);        /* newest   */
+    float x_old = cb_read_at_offset(cb, W);        /* leaving  */
+
+    if (!ma->filled) {
+        /* Bootstrap: sum the first W elements directly          */
+        ma->sum    = 0.0;
+        for (int i = 0; i < W; i++)
+            ma->sum += cb_read_at_offset(cb, i);
+        ma->filled = 1;
+    } else {
+        ma->sum = ma->sum + x_new - x_old;
+    }
+    return (float)(ma->sum / W);
+}
+
+/* ============================================================
+ *  3. ANOMALY DETECTION
+ * ============================================================ */
+#define PRIORITY_CRITICAL 1
+#define PRIORITY_WARNING  2
+#define PRIORITY_INFO     3
+
+typedef struct {
+    int   sensor_id;
+    float value;
+    float threshold;
+    int   direction;   /* -1 = below low, +1 = above high       */
+    int   priority;
+    long  timestamp;
+} Event;
+
+/**
+ * anomaly_check — compare moving average against thresholds.
+ * Fills *out_event if a violation is found.
+ * Returns 1 if anomaly detected, 0 otherwise.
+ * Time: O(1)
+ */
+int anomaly_check(int sensor_id, float avg,
+                  float low, float high,
+                  int priority_level,
+                  Event *out_event, long ts) {
+    int triggered = 0;
+    if (avg < low) {
+        out_event->direction = -1;
+        out_event->threshold = low;
+        triggered = 1;
+    } else if (avg > high) {
+        out_event->direction = +1;
+        out_event->threshold = high;
+        triggered = 1;
+    }
+    if (triggered) {
+        out_event->sensor_id = sensor_id;
+        out_event->value     = avg;
+        out_event->priority  = priority_level;
+        out_event->timestamp = ts;
+    }
+    return triggered;
+}
+
+/* ============================================================
+ *  4. PRIORITY QUEUE (Min-Heap, array-based)
+ * ============================================================ */
+typedef struct {
+    Event data[PQ_CAPACITY];
+    int   size;
+} PriorityQueue;
+
+void pq_init(PriorityQueue *pq) { pq->size = 0; }
+
+static void pq_swap(PriorityQueue *pq, int a, int b) {
+    Event tmp = pq->data[a];
+    pq->data[a] = pq->data[b];
+    pq->data[b] = tmp;
+}
+
+/**
+ * pq_insert — insert event; bubble up to restore heap property.
+ * Time: O(log N)   Space: O(1) additional
+ */
+int pq_insert(PriorityQueue *pq, Event e) {
+    if (pq->size >= PQ_CAPACITY) return -1;   /* queue full     */
+    pq->data[pq->size] = e;
+    int i = pq->size++;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (pq->data[parent].priority > pq->data[i].priority) {
+            pq_swap(pq, parent, i);
+            i = parent;
+        } else break;
+    }
+    return 0;
+}
+
+/**
+ * pq_extract — remove and return the highest-priority event.
+ * Time: O(log N)
+ */
+Event pq_extract(PriorityQueue *pq) {
+    Event result = pq->data[0];
+    pq->data[0]  = pq->data[--pq->size];
+    int i = 0;
+    while (1) {
+        int left  = 2 * i + 1;
+        int right = 2 * i + 2;
+        int smallest = i;
+        if (left  < pq->size &&
+            pq->data[left].priority  < pq->data[smallest].priority)
+            smallest = left;
+        if (right < pq->size &&
+            pq->data[right].priority < pq->data[smallest].priority)
+            smallest = right;
+        if (smallest == i) break;
+        pq_swap(pq, i, smallest);
+        i = smallest;
+    }
+    return result;
+}
+
+int pq_is_empty(const PriorityQueue *pq) { return pq->size == 0; }
+
+/* ============================================================
+ *  5. SENSOR SIMULATION
+ * ============================================================ */
+#if SIMULATION
+
+/* Pre-defined test data (30 cycles).
+ * Cycle 6  → temperature drops below 10 °C (CRITICAL).
+ * Cycle 7  → humidity exceeds 90 %RH       (WARNING).
+ * Cycle 20 → soil moisture drops below 500  (WARNING).
+ */
+static float sim_temp[] = {
+    25.0f, 24.8f, 25.2f, 25.1f, 24.9f,  /* cycles 1-5  normal  */
+     8.0f, 25.0f, 25.3f, 24.7f, 25.0f,  /* cycle  6    CRITICAL*/
+    25.1f, 24.9f, 25.2f, 25.0f, 24.8f,
+    25.0f, 25.1f, 24.9f, 25.0f, 25.2f,
+    24.8f, 25.0f, 25.1f, 25.0f, 24.9f,
+    25.0f, 25.2f, 24.8f, 25.1f, 25.0f
+};
+static float sim_hum[] = {
+    60.0f, 60.5f, 59.8f, 60.2f, 60.1f,
+    60.0f, 92.0f, 60.3f, 60.0f, 59.9f,  /* cycle  7    WARNING */
+    60.2f, 60.0f, 59.7f, 60.5f, 60.1f,
+    60.0f, 60.3f, 60.1f, 59.8f, 60.2f,
+    60.0f, 60.1f, 60.3f, 59.9f, 60.2f,
+    60.0f, 60.1f, 60.4f, 60.0f, 59.8f
+};
+static float sim_soil[] = {
+    2000.f,1990.f,2010.f,2005.f,1995.f,
+    2000.f,2003.f,1998.f,2007.f,2001.f,
+    1999.f,2004.f,2002.f,1997.f,2000.f,
+    1998.f,2003.f,2001.f,1999.f, 400.f, /* cycle 20    WARNING */
+    2000.f,2002.f,1998.f,2005.f,2000.f,
+    1999.f,2001.f,2000.f,2003.f,1997.f
+};
+
+#define SIM_CYCLES (sizeof(sim_temp) / sizeof(sim_temp[0]))
+
+float sensor_read(int channel, int cycle) {
+    if (channel == SENSOR_TEMP) return sim_temp[cycle];
+    if (channel == SENSOR_HUM)  return sim_hum [cycle];
+    if (channel == SENSOR_SOIL) return sim_soil[cycle];
+    return INVALID_VAL;
+}
+
+#endif /* SIMULATION */
+
+/* ============================================================
+ *  6. HELPER — print utilities
+ * ============================================================ */
+static const char *sensor_name(int id) {
+    switch (id) {
+        case SENSOR_TEMP: return "TEMP";
+        case SENSOR_HUM:  return "HUM ";
+        case SENSOR_SOIL: return "SOIL";
+        default:          return "????";
+    }
+}
+
+static const char *sensor_unit(int id) {
+    switch (id) {
+        case SENSOR_TEMP: return "°C ";
+        case SENSOR_HUM:  return "%RH";
+        case SENSOR_SOIL: return "ADC";
+        default:          return "   ";
+    }
+}
+
+static const char *priority_label(int p) {
+    switch (p) {
+        case PRIORITY_CRITICAL: return "CRITICAL";
+        case PRIORITY_WARNING:  return "WARNING ";
+        default:                return "INFO    ";
+    }
+}
+
+/* ============================================================
+ *  7. MAIN — acquisition loop
+ * ============================================================ */
+int main(void) {
+    printf("=======================================================\n");
+    printf("  Real-Time Multi-Sensor Data Acquisition System\n");
+    printf("  Week 4 — Algorithm Demonstration\n");
+    printf("  Soroti University  |  CPE2206  |  Group 1\n");
+    printf("=======================================================\n\n");
+
+    /* --- Initialise circular buffers --- */
+    CircularBuffer buffers[NUM_SENSORS];
+    int buf_sizes[NUM_SENSORS] = {TEMP_BUF_SIZE, HUM_BUF_SIZE, SOIL_BUF_SIZE};
+    for (int s = 0; s < NUM_SENSORS; s++)
+        cb_init(&buffers[s], buf_sizes[s]);
+
+    /* --- Initialise moving-average state --- */
+    MovingAvg ma[NUM_SENSORS];
+    int win[NUM_SENSORS] = {TEMP_WIN, HUM_WIN, SOIL_WIN};
+    for (int s = 0; s < NUM_SENSORS; s++)
+        ma_init(&ma[s], win[s]);
+
+    /* --- Initialise priority queue --- */
+    PriorityQueue pq;
+    pq_init(&pq);
+
+    /* --- Threshold tables (low, high, priority) --- */
+    float low_thresh [NUM_SENSORS] = {TEMP_LOW,  HUM_LOW,  SOIL_LOW };
+    float high_thresh[NUM_SENSORS] = {TEMP_HIGH, HUM_HIGH, SOIL_HIGH};
+    int   priorities [NUM_SENSORS] = {PRIORITY_CRITICAL,
+                                      PRIORITY_WARNING,
+                                      PRIORITY_WARNING};
+
+    /* ── MAIN ACQUISITION LOOP ──────────────────────────────── */
+    int total_events = 0;
+
+    for (int cycle = 0; cycle < (int)SIM_CYCLES; cycle++) {
+        long ts = (long)cycle + 1;   /* simulated 1-second ticks */
+
+        printf("── Cycle %2ld ─────────────────────────────────────────\n",
+               ts);
+
+        for (int s = 0; s < NUM_SENSORS; s++) {
+            /* Step 1: Read sensor (simulated or real) */
+            float raw = sensor_read(s, cycle);
+
+            /* Step 2: Write to circular buffer — O(1) */
+            cb_write(&buffers[s], raw);
+
+            /* Step 3: Compute moving average — O(1) */
+            float avg = ma_update(&ma[s], &buffers[s]);
+
+            printf("  [%s] raw=%7.2f %s  avg=%7.2f %s",
+                   sensor_name(s), raw, sensor_unit(s),
+                   avg, sensor_unit(s));
+
+            /* Step 4: Anomaly detection — O(1) */
+            Event ev;
+            memset(&ev, 0, sizeof(ev));
+            if (anomaly_check(s, avg,
+                              low_thresh[s], high_thresh[s],
+                              priorities[s], &ev, ts)) {
+                printf("  *** %s: %s %s threshold (%.2f %s)",
+                       priority_label(ev.priority),
+                       sensor_name(s),
+                       ev.direction < 0 ? "BELOW LOW" : "ABOVE HIGH",
+                       ev.threshold,
+                       sensor_unit(s));
+                /* Step 5: Enqueue event — O(log N) */
+                if (pq_insert(&pq, ev) == 0)
+                    total_events++;
+                else
+                    printf("  [PQ FULL - event dropped]");
+            }
+            printf("\n");
+        }
+        printf("\n");
+    }
+
+    /* ── DRAIN PRIORITY QUEUE ─────────────────────────────── */
+    printf("=======================================================\n");
+    printf("  Priority Queue — %d event(s) pending\n", pq.size);
+    printf("=======================================================\n");
+    int rank = 1;
+    while (!pq_is_empty(&pq)) {
+        Event e = pq_extract(&pq);
+        printf("  [%d] %s | sensor=%-4s | avg=%7.2f | ts=%lds\n",
+               rank++,
+               priority_label(e.priority),
+               sensor_name(e.sensor_id),
+               e.value,
+               e.timestamp);
+    }
+
+    /* ── MEMORY SUMMARY ──────────────────────────────────────  */
+    printf("\n=======================================================\n");
+    printf("  Static Memory Footprint\n");
+    printf("=======================================================\n");
+    int buf_bytes = 0;
+    for (int s = 0; s < NUM_SENSORS; s++)
+        buf_bytes += buf_sizes[s] * (int)sizeof(float);
+    int pq_bytes   = PQ_CAPACITY * (int)sizeof(Event);
+    int ma_bytes   = NUM_SENSORS * (int)sizeof(MovingAvg);
+    int total_bytes = buf_bytes + pq_bytes + ma_bytes;
+    printf("  Circular buffers : %4d bytes\n", buf_bytes);
+    printf("  Priority queue   : %4d bytes\n", pq_bytes);
+    printf("  Moving-avg state : %4d bytes\n", ma_bytes);
+    printf("  ─────────────────────────────\n");
+    printf("  Total            : %4d bytes  (%.1f%% of 64 KB)\n",
+           total_bytes, total_bytes / 655.36);
+
+    /* ── CLEANUP ─────────────────────────────────────────────  */
+    for (int s = 0; s < NUM_SENSORS; s++)
+        cb_free(&buffers[s]);
+
+    printf("\nDone. Total anomaly events raised: %d\n", total_events);
+    return 0;
+}
